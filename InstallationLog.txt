@@ -1,0 +1,8 @@
+************************************* Invoked: Mon Oct 21 06:47:28 2024
+[0] Arguments: C:\Users\Kris\OneDrive - EGIS Group\_EGIS-NA-IT\PROJECTS\go-file-scanner\msys2-x86_64-20230526.exe, install, --confirm-command
+[5] Operations sanity check succeeded.
+[13] Using metadata cache from "C:/Users/Kris/AppData/Local/cache\\qt-installer-framework\\d75f1c19-3379-3717-ae8d-1404b51494a9"
+[13] Found 0 cached items.
+[15] Loaded control script ":/metadata/installer-config/control_js.js"
+[15] No target directory specified, using default value: ""
+[15] Warning: The installation path cannot be empty, please specify a valid directory.
