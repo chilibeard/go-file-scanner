@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,32 +34,48 @@ var (
 	paused        bool
 	cancelFunc    context.CancelFunc
 	scanDone      chan struct{}
-	logChan       chan string
+	logFile       *os.File
 )
 
+type multiWriter struct {
+	writers []io.Writer
+}
+
+func (mw *multiWriter) Write(p []byte) (n int, err error) {
+	for _, w := range mw.writers {
+		n, err = w.Write(p)
+		if err != nil {
+			return
+		}
+	}
+	return len(p), nil
+}
+
 func main() {
-	// Set up logging
-	logFile, err := os.OpenFile("file_scanner.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	var err error
+	logFile, err = os.OpenFile("file_scanner.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("Error opening log file: %v", err)
 	}
 	defer logFile.Close()
-	log.SetOutput(logFile)
 
-	// Set up panic recovery
+	mw := &multiWriter{
+		writers: []io.Writer{os.Stdout, logFile},
+	}
+	log.SetOutput(mw)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Panic recovered: %v\n%s", r, debug.Stack())
-			fmt.Printf("The application has crashed. Please check the log file 'file_scanner.log' for details.\n")
+			log.Printf("Panic recovered: %v\nStack Trace:\n%s", r, debug.Stack())
 		}
 	}()
 
-	logChan = make(chan string, 100)
+	log.Println("Application started")
 
 	myApp := app.New()
 	myWindow := myApp.NewWindow("File Scanner")
 
-	// Database connection fields
 	serverEntry := widget.NewEntry()
 	serverEntry.SetPlaceHolder("Server")
 
@@ -73,30 +91,18 @@ func main() {
 	dbNameEntry := widget.NewEntry()
 	dbNameEntry.SetPlaceHolder("Database Name")
 
-	// Load saved credentials if available
 	if err := loadCredentials(serverEntry, portEntry, usernameEntry, passwordEntry, dbNameEntry); err != nil {
 		log.Printf("Error loading credentials: %v", err)
 		dialog.ShowError(err, myWindow)
 	}
 
-	// Status label
 	statusLabel := widget.NewLabel("Status: Not connected")
-
-	// Progress label
 	progressLabel := widget.NewLabel("Progress: Not started")
 
-	// Log viewer
-	logViewer := widget.NewMultiLineEntry()
-	logViewer.Disable()
-
-	// Connect button
 	connectButton := widget.NewButton("Connect", nil)
-
-	// Create or select table buttons
 	createTableButton := widget.NewButton("Create New Table", nil)
 	selectTableButton := widget.NewButton("Select Existing Table", nil)
 
-	// Folder selection
 	folderEntry := widget.NewEntry()
 	folderEntry.SetPlaceHolder("Enter or select folder path to scan")
 	browseButton := widget.NewButton("Browse", func() {
@@ -108,28 +114,27 @@ func main() {
 			}
 			if uri != nil {
 				folderEntry.SetText(uri.Path())
+				log.Printf("Selected folder path: %s", uri.Path())
 			}
 		}, myWindow)
 	})
 
-	// Manual path input button
 	manualPathButton := widget.NewButton("Enter UNC Path", func() {
 		entry := widget.NewEntry()
 		entry.SetPlaceHolder("Enter UNC path (e.g., \\\\server\\share)")
 		dialog.ShowCustomConfirm("Enter UNC Path", "OK", "Cancel", entry, func(b bool) {
 			if b {
 				folderEntry.SetText(entry.Text)
+				log.Printf("Manually entered folder path: %s", entry.Text)
 			}
 		}, myWindow)
 	})
 
-	// Scan control buttons
 	startButton := widget.NewButton("Start Scan", nil)
 	pauseButton := widget.NewButton("Pause Scan", nil)
 	resumeButton := widget.NewButton("Resume Scan", nil)
 	stopButton := widget.NewButton("Stop Scan", nil)
 
-	// Disable buttons initially
 	createTableButton.Disable()
 	selectTableButton.Disable()
 	startButton.Disable()
@@ -137,23 +142,22 @@ func main() {
 	resumeButton.Disable()
 	stopButton.Disable()
 
-	// Database connection
 	var db *sql.DB
+	var tableName string
+
 	connectButton.OnTapped = func() {
 		server := serverEntry.Text
 		port := portEntry.Text
 		if port == "" {
-			port = "1433" // Default SQL Server port
+			port = "1433"
 		}
 		username := usernameEntry.Text
 		password := passwordEntry.Text
 		dbName := dbNameEntry.Text
 
-		// Connection string for SQL Server
 		connString := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=%s;",
 			server, username, password, port, dbName)
 
-		// Open database connection
 		var err error
 		db, err = sql.Open("sqlserver", connString)
 		if err != nil {
@@ -162,7 +166,6 @@ func main() {
 			return
 		}
 
-		// Test the connection
 		err = db.Ping()
 		if err != nil {
 			log.Printf("Error pinging database: %v", err)
@@ -170,7 +173,6 @@ func main() {
 			return
 		}
 
-		// Save credentials
 		if err := saveCredentials(serverEntry, portEntry, usernameEntry, passwordEntry, dbNameEntry); err != nil {
 			log.Printf("Error saving credentials: %v", err)
 			dialog.ShowError(err, myWindow)
@@ -182,15 +184,12 @@ func main() {
 		selectTableButton.Enable()
 	}
 
-	// Table selection
-	var tableName string
 	createTableButton.OnTapped = func() {
 		entry := widget.NewEntry()
 		entry.SetPlaceHolder("Enter New Table Name")
 		dialog.ShowCustomConfirm("Create New Table", "Create", "Cancel", entry, func(b bool) {
 			if b {
 				tableName = entry.Text
-				// Create table
 				err := createTable(db, tableName)
 				if err != nil {
 					log.Printf("Error creating table: %v", err)
@@ -205,7 +204,6 @@ func main() {
 	}
 
 	selectTableButton.OnTapped = func() {
-		// Retrieve existing tables
 		tables, err := getTables(db)
 		if err != nil {
 			log.Printf("Error getting tables: %v", err)
@@ -218,7 +216,6 @@ func main() {
 			return
 		}
 
-		// Let user select a table
 		tableSelect := widget.NewSelect(tables, func(value string) {
 			tableName = value
 		})
@@ -231,11 +228,17 @@ func main() {
 		}, myWindow)
 	}
 
-	// Scan control functions
 	startButton.OnTapped = func() {
-		if folderEntry.Text == "" {
+		folderPath := strings.TrimSpace(folderEntry.Text)
+		if folderPath == "" {
 			log.Println("Error: No folder path provided")
 			statusLabel.SetText("Error: Please enter or select a folder path to scan")
+			return
+		}
+
+		if _, err := os.Stat(folderPath); os.IsNotExist(err) {
+			log.Printf("Error: Folder path does not exist: %s", folderPath)
+			statusLabel.SetText(fmt.Sprintf("Error: Folder path does not exist: %s", folderPath))
 			return
 		}
 
@@ -246,13 +249,12 @@ func main() {
 		stopButton.Enable()
 		statusLabel.SetText("Status: Scanning")
 
-		// Load previous scan state if available
 		if err := loadScanState(); err != nil {
 			log.Printf("Error loading scan state: %v", err)
 			dialog.ShowError(fmt.Errorf("Error loading scan state: %v", err), myWindow)
 		}
 
-		scanState.FolderPath = folderEntry.Text
+		scanState.FolderPath = folderPath
 		if scanState.FilesScanned == nil {
 			scanState.FilesScanned = make(map[string]bool)
 		}
@@ -263,7 +265,8 @@ func main() {
 
 		go func() {
 			defer close(scanDone)
-			err := scanFolder(ctx, db, tableName, scanState.FolderPath)
+			log.Printf("Starting scan of folder: %s", folderPath)
+			err := scanFolder(ctx, db, tableName, folderPath)
 			if err != nil {
 				if err == context.Canceled {
 					log.Println("Scan stopped")
@@ -293,15 +296,25 @@ func main() {
 			}
 		}()
 
-		// Start progress update routine
+		ticker := time.NewTicker(100 * time.Millisecond)
 		go func() {
-			for scanning {
-				time.Sleep(1 * time.Second)
-				filesScanned, filesWritten, scanSpeed, writeSpeed := GetProgressStats()
-				progressText := fmt.Sprintf("Progress: Scanned %d files, Written %d files\nScan speed: %.2f files/sec, Write speed: %.2f files/sec",
-					filesScanned, filesWritten, scanSpeed, writeSpeed)
-				log.Println(progressText)
-				progressLabel.SetText(progressText)
+			for {
+				select {
+				case <-ticker.C:
+					if !scanning {
+						ticker.Stop()
+						return
+					}
+					filesScanned, filesWritten, scanSpeed, writeSpeed := GetProgressStats()
+					progressText := fmt.Sprintf("Progress: Scanned %d files, Written %d files\nScan speed: %.2f files/sec, Write speed: %.2f files/sec",
+						filesScanned, filesWritten, scanSpeed, writeSpeed)
+					log.Println(progressText)
+					progressLabel.SetText(progressText)
+					myWindow.Canvas().Refresh(progressLabel)
+				case <-scanDone:
+					ticker.Stop()
+					return
+				}
 			}
 		}()
 	}
@@ -338,10 +351,10 @@ func main() {
 			stopButton.Disable()
 			log.Println("Scan stopped")
 			statusLabel.SetText("Status: Scan stopped")
+			myWindow.Content().Refresh()
 		}()
 	}
 
-	// Check for existing scan state
 	exists, err := scanStateExists()
 	if err != nil {
 		log.Printf("Error checking scan state: %v", err)
@@ -365,7 +378,6 @@ func main() {
 		}, myWindow)
 	}
 
-	// Layout
 	topForm := container.NewVBox(
 		widget.NewLabel("Connect to SQL Server"),
 		serverEntry,
@@ -400,18 +412,9 @@ func main() {
 		bottomForm,
 		statusLabel,
 		progressLabel,
-		widget.NewLabel("Log:"),
-		logViewer,
 	)
 
-	// Start log update routine
-	go func() {
-		for logMsg := range logChan {
-			logViewer.SetText(logViewer.Text + logMsg + "\n")
-		}
-	}()
-
 	myWindow.SetContent(content)
-	myWindow.Resize(fyne.NewSize(600, 800))
+	myWindow.Resize(fyne.NewSize(600, 600))
 	myWindow.ShowAndRun()
 }

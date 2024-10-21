@@ -25,8 +25,8 @@ var (
 )
 
 const (
-	batchSize  = 1000
-	numWorkers = 20
+	batchSize  = 100
+	numWorkers = 10
 )
 
 func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) error {
@@ -66,11 +66,7 @@ func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) e
 					fileInfo, err := processFile(filePath)
 					if err != nil {
 						log.Printf("Error processing file %s: %v", filePath, err)
-						select {
-						case errChan <- err:
-						default:
-						}
-						return
+						continue // Skip this file and continue with others
 					}
 					resultChan <- fileInfo
 					atomic.AddInt64(&totalFilesScanned, 1)
@@ -88,10 +84,7 @@ func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) e
 			if len(batch) >= batchSize {
 				if err := batchInsert(db, tableName, batch); err != nil {
 					log.Printf("Error batch inserting: %v", err)
-					select {
-					case errChan <- err:
-					default:
-					}
+					errChan <- fmt.Errorf("error batch inserting: %v", err)
 					return
 				}
 				atomic.AddInt64(&totalFilesWritten, int64(len(batch)))
@@ -101,10 +94,7 @@ func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) e
 		if len(batch) > 0 {
 			if err := batchInsert(db, tableName, batch); err != nil {
 				log.Printf("Error batch inserting final batch: %v", err)
-				select {
-				case errChan <- err:
-				default:
-				}
+				errChan <- fmt.Errorf("error batch inserting final batch: %v", err)
 				return
 			}
 			atomic.AddInt64(&totalFilesWritten, int64(len(batch)))
@@ -117,7 +107,7 @@ func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) e
 		err := filepath.WalkDir(folderPath, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				log.Printf("Error walking directory at %s: %v", path, err)
-				return err
+				return nil // Continue walking despite the error
 			}
 			if d.IsDir() {
 				return nil
@@ -139,10 +129,7 @@ func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) e
 		})
 		if err != nil {
 			log.Printf("Error walking directory: %v", err)
-			select {
-			case errChan <- fmt.Errorf("error walking directory: %v", err):
-			default:
-			}
+			errChan <- fmt.Errorf("error walking directory: %v", err)
 		}
 	}()
 
@@ -156,13 +143,12 @@ func scanFolder(ctx context.Context, db *sql.DB, tableName, folderPath string) e
 		log.Println("Scan cancelled")
 		return ctx.Err()
 	case err := <-errChan:
-		if err != nil {
-			log.Printf("Error during scan: %v", err)
-			return err
-		}
+		log.Printf("Scan completed with error: %v", err)
+		return err
+	case <-resultChan:
+		log.Println("Scan completed successfully")
 	}
 
-	log.Println("Scan completed successfully")
 	return nil
 }
 
@@ -172,18 +158,19 @@ func processFile(filePath string) (FileInfo, error) {
 		return FileInfo{}, fmt.Errorf("error getting file info: %v", err)
 	}
 
+	// Create a unique hash based on the file path
 	hasher := sha256.New()
 	hasher.Write([]byte(filePath))
 	pathHash := hex.EncodeToString(hasher.Sum(nil))
 
 	return FileInfo{
-		Name:         info.Name(),
-		Size:         info.Size(),
-		LastModified: info.ModTime(),
-		ETag:         "", // You may want to implement ETag generation
-		PathHash:     pathHash,
-		ItemPath:     filePath,
-		Extension:    filepath.Ext(filePath),
+		FileName:      info.Name(),
+		FilePath:      filePath,
+		PathHash:      pathHash,
+		FileSize:      info.Size(),
+		ModTime:       info.ModTime(),
+		OtherMetadata: "", // You may want to implement other metadata collection
+		Extension:     filepath.Ext(filePath),
 	}, nil
 }
 
